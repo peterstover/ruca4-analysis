@@ -1,0 +1,997 @@
+---
+title: "RUCA = 4 Analysis"
+output: html_notebook
+---
+
+```{r cache=TRUE}
+library(readxl)
+library(tidyverse)
+library(tidycensus)
+#import data
+counties<- read_excel("C:/Users/peter/Downloads/2022-geography-reference-manual.xlsx")
+RUCA <- read_excel("C:/Users/peter/Downloads/ruca2010revised (1).xlsx")
+
+#Filter only metro counties
+metro_msa_codes <- counties %>%
+  filter(`GEO-TYPE` =="08" & grepl("Metro Area", TITLE)) %>%
+  pull(`MSA Code`) %>%
+  unique()
+metro_counties <- counties %>%
+  filter(`GEO-TYPE` == "03", `MSA Code` %in% metro_msa_codes)
+metro_counties <- metro_counties %>% 
+    mutate(FIPS_State_County = paste0(`FIPS State Code`, `FIPS County Code`))
+ 
+metro_tracts <- RUCA %>%
+    semi_join(metro_counties, by = c("State-County FIPS Code" = "FIPS_State_County"))
+nonmetro_tracts <- RUCA %>%
+    anti_join(metro_counties, by = c("State-County FIPS Code" = "FIPS_State_County"))
+nmt <- nonmetro_tracts %>%
+    filter(`Primary RUCA Code 2010`==4)
+mt<- metro_tracts %>%
+    filter(`Primary RUCA Code 2010`==4)
+mpolis<- RUCA%>%
+  filter(`Primary RUCA Code 2010`==1)
+national<-RUCA
+nm45<- nonmetro_tracts %>%
+    filter(`Primary RUCA Code 2010`==4|`Primary RUCA Code 2010`==5)
+mt45<- metro_tracts %>%
+    filter(`Primary RUCA Code 2010`==4|`Primary RUCA Code 2010`==5)
+```
+
+```{r}
+df <- tribble(
+  ~Category,     ~Metric,              ~Value,
+  "Metro",       "Population (millions)",         sum(mt$`Tract Population, 2010`)/1e6,
+  "Nonmetro",    "Population (millions)",         sum(nmt$`Tract Population, 2010`)/1e6,
+  "Metro",       "Land Area (million mi^2)",      sum(mt$`Land Area (square miles), 2010`)/1e6,
+  "Nonmetro",    "Land Area (million mi^2)",      sum(nmt$`Land Area (square miles), 2010`)/1e6,
+  "Metro",       "Population Density (people/mi^2)",   sum(mt$`Tract Population, 2010`)/sum(mt$`Land Area (square miles), 2010`),
+  "Nonmetro",    "Population Density (people/mi^2)",  sum(nmt$`Tract Population, 2010`)/sum(nmt$`Land Area (square miles), 2010`)
+)
+
+# Plot
+ggplot(df, aes(x = Category, y = Value, fill = Category)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(title = "Metro vs Nonmetro Population Comparison (2010)",
+       x = "County Type", y = NULL) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+```{r}
+##Function to pull census data from ACS
+npull_ACS_yrs_fast <- function(variable_code, population = "B01001_001", years,
+                                         metro_trimmed = mt, nmetro_trimmed = nmt,
+                                         crosswalk_path = "C:/Users/peter/Documents/ct20_ct10_xwalk.csv"
+                                         ){
+
+  data("fips_codes")
+  
+  crosswalk <- read_csv(crosswalk_path, show_col_types = FALSE) %>%
+    rename(
+      GEOID_2020 = TRTID2020,
+      GEOID_2010 = TRTID2010,
+      weight = TR20_TO_TR10_WEIGHT
+    ) %>%
+    mutate(
+      GEOID_2020 = as.character(GEOID_2020),
+      GEOID_2010 = as.character(GEOID_2010)
+    )
+  
+  states <- unique(fips_codes$state)[1:51]
+  
+  for (yr in years) {
+    message(paste("Pulling data for year", yr))
+    
+    # Pull ACS data
+    acs_data <- map_dfr(states, function(st) {
+      tryCatch({
+        get_acs(
+          geography = "tract",
+          state = st,
+          variables = c(main = variable_code, pop = population),
+          year = yr,
+          survey = "acs5",
+          cache_table = TRUE
+        ) %>%
+          select(GEOID, variable, estimate)
+      }, error = function(e) {
+        warning(paste("Skipping", st, "due to error:", e$message))
+        NULL
+      })
+    })
+    
+
+    merged_data <- acs_data %>%
+      pivot_wider(names_from = variable, values_from = estimate) %>%
+      rename(
+        estimate = main,
+        population = pop
+      ) %>%
+      mutate(GEOID = as.character(GEOID))
+    
+    # Normalize to 2010 tracts if year > 2020
+    if (yr >= 2021) {
+      merged_data <- merged_data %>%
+        rename(GEOID_2020 = GEOID) %>%
+        left_join(crosswalk, by = "GEOID_2020") %>%
+        mutate(
+          estimate_weighted = estimate * weight,
+          population_weighted = population * weight
+        ) %>%
+        group_by(GEOID_2010) %>%
+        summarise(
+          !!paste0("estimate_", yr) := sum(estimate_weighted, na.rm = TRUE),
+          !!paste0("population_", yr) := sum(population_weighted, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          !!paste0("rate_", yr) := .data[[paste0("estimate_", yr)]] / .data[[paste0("population_", yr)]]
+        ) %>%
+        rename(`State-County-Tract FIPS Code` = GEOID_2010)
+    } else {
+      # For 2010 or 2020 data, no normalization
+      merged_data <- merged_data %>%
+        rename(`State-County-Tract FIPS Code` = GEOID) %>%
+        mutate(
+          !!paste0("estimate_", yr) := estimate,
+          !!paste0("population_", yr) := population,
+          !!paste0("rate_", yr) := estimate / population
+        ) %>%
+        select(`State-County-Tract FIPS Code`, ends_with(as.character(yr)))
+    }
+    
+    # Merge with metro and nonmetro data
+    metro_trimmed <- left_join(metro_trimmed, merged_data, by = "State-County-Tract FIPS Code")
+    nmetro_trimmed <- left_join(nmetro_trimmed, merged_data, by = "State-County-Tract FIPS Code")
+  }
+  
+  return(list(metro = metro_trimmed, nonmetro = nmetro_trimmed))
+}
+```
+
+```{r cache=TRUE}
+fedutables<-npull_ACS_yrs_fast("B14004_031","B15001_044",c(2013,2018,2023),mt,nmt)
+```
+
+```{r cache=TRUE}
+fedum <- fedutables[[1]]
+fedunm <- fedutables[[2]]
+
+drop_na_estimates <- function(df) {
+  df %>% filter(if_all(starts_with("estimate"), ~ !is.na(.)))
+  }
+fedum <-drop_na_estimates(fedum)%>%
+  filter(rate_2023<=1)
+fedunm <- drop_na_estimates(fedunm)%>%
+  filter(rate_2023<=1)
+```
+
+```{r}
+summarize_joined_rates <- function(metro_df, nonmetro_df, years) {
+  results <- tibble()
+  
+  for (yr in years) {
+    est_col <- paste0("estimate_", yr)  # numerator
+    pop_col <- paste0("population_", yr)  # denominator
+    
+    if (est_col %in% names(metro_df) && pop_col %in% names(metro_df)) {
+      metro_rate <- sum(metro_df[[est_col]], na.rm = TRUE) / 
+        sum(metro_df[[pop_col]], na.rm = TRUE)
+    } else {
+      metro_rate <- NA_real_
+    }
+    
+    if (est_col %in% names(nonmetro_df) && pop_col %in% names(nonmetro_df)) {
+      nonmetro_rate <- sum(nonmetro_df[[est_col]], na.rm = TRUE) / 
+        sum(nonmetro_df[[pop_col]], na.rm = TRUE)
+    } else {
+      nonmetro_rate <- NA_real_
+      }
+    
+      results <- bind_rows(results, tibble(
+      Year = yr,
+      Metro = metro_rate,
+      Nonmetro = nonmetro_rate
+    ))
+  }
+  
+  return(results)
+}
+```
+
+```{r}
+f_unenrollment<-summarize_joined_rates(fedum,fedunm,years = seq(2013,2023,by=5))
+funenrollment_long <- f_unenrollment %>%
+  pivot_longer(cols = c(Metro, Nonmetro), names_to = "fCategory", values_to = "funEnrollmentRate")
+
+# Plot
+ggplot(funenrollment_long, aes(x = Year, y = 1-funEnrollmentRate, color = fCategory)) +
+  geom_line(size = 1.2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(.25, .7)) +
+  scale_x_continuous(breaks = seq(2009, 2023, by = 2)) +
+  scale_color_manual(values = c("Metro" = "darkgreen", "Nonmetro" = "skyblue")) +
+  labs(
+    title = "Proportion Enrolled in Higher Education (Females 18–24) Over Time",
+    x = "Year",
+    y = "Enrollment Rate",
+    color = "County Type"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r cache=TRUE}
+
+maleedutables<-npull_ACS_yrs_fast("B14004_015","B15001_003",c(2013,2018,2023),mt,nmt)
+```
+
+```{r cache=TRUE}
+medum <- maleedutables [[1]]
+medunm <- maleedutables [[2]]
+
+medum <-drop_na_estimates(medum)
+medunm <- drop_na_estimates(medunm)
+
+m_unenrollment<-summarize_joined_rates(medum,medunm,years = seq(2013,2023,by=5))
+
+munenrollment_long <- m_unenrollment %>%
+  pivot_longer(cols = c(Metro, Nonmetro), names_to = "mCategory", values_to = "munEnrollmentRate")
+
+# Plot
+ggplot(munenrollment_long, aes(x = Year, y = 1-munEnrollmentRate, color = mCategory)) +
+  geom_line(size = 1.2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(.25, .7)) +
+  scale_x_continuous(breaks = seq(2013, 2023, by = 2)) +
+  scale_color_manual(values = c("Metro" = "darkgreen", "Nonmetro" = "skyblue")) +
+  labs(
+    title = "Proportion Enrolled in Higher Education (Males 18–24) Over Time",
+    x = "Year",
+    y = "Enrollment Rate",
+    color = "County Type"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Prepare male data
+m2enrollment_long <- m_unenrollment %>%
+  pivot_longer(cols = c(Metro, Nonmetro), names_to = "Category", values_to = "unEnrollmentRate") %>%
+  mutate(Sex = "Male", NonEnrollment =  unEnrollmentRate)
+
+# Prepare female data
+f2enrollment_long <- f_unenrollment %>%
+  pivot_longer(cols = c(Metro, Nonmetro), names_to = "Category", values_to = "unEnrollmentRate") %>%
+  mutate(Sex = "Female", NonEnrollment = unEnrollmentRate)
+
+# Combine both datasets
+combined_enrollment <- bind_rows(m2enrollment_long, f2enrollment_long)
+
+# Plot
+ggplot(combined_enrollment, aes(x = Year, y = 1- NonEnrollment, color = Category, linetype = Sex)) +
+    geom_line(size = 1.2) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(.15, 0.6)
+  ) +
+  scale_x_continuous(breaks = seq(2009, 2023, by = 2)) +
+  scale_color_manual(values = c("Metro" = "darkgreen", "Nonmetro" = "skyblue")) +
+  labs(
+    title = "Proportion Enrolled in Higher Education (Ages 18–24)",
+    subtitle = "By Sex and County Type",
+    x = "Year",
+    y = "Enrollment Rate",
+    color = "County Type",
+    linetype = "Sex"
+  ) +
+  theme_minimal()
+
+
+
+```
+```{r}
+###SPLIT Male Enrollment into Quartiles for further analysis
+x=quantile(medunm$population_2013,.01,na.rm = TRUE)
+medunm75 <- medunm %>%
+  filter(rate_2013 <= quantile(rate_2013, 0.25, na.rm = TRUE),population_2013>x) %>%
+  mutate(Quartile = "Q4")
+medunm25 <- medunm %>%
+  filter(rate_2013 >= quantile(rate_2013, 0.75, na.rm = TRUE),population_2013>x) %>%
+  mutate(Quartile = "Q1")
+medunm50 <- medunm %>%
+  filter(rate_2013 > quantile(rate_2013, 0.25, na.rm = TRUE), rate_2013 < quantile(rate_2013, 0.75, na.rm = TRUE),population_2013>x) %>%
+  mutate(Quartile = "Q2-Q3")
+medum75 <- medum %>%
+  filter(rate_2013 <= quantile(rate_2013, 0.25, na.rm = TRUE),population_2013>x) %>%
+  mutate(Quartile = "Q4")
+medum25 <- medum %>%
+  filter(rate_2013 >= quantile(rate_2013, 0.75, na.rm = TRUE),population_2013>x) %>%
+  mutate(Quartile = "Q1")
+medum50 <- medum %>%
+  filter(rate_2013 > quantile(rate_2013, 0.25, na.rm = TRUE), rate_2013 < quantile(rate_2013, 0.75, na.rm = TRUE),population_2013>x) %>%
+  mutate(Quartile = "Q2-Q3")
+medumcombined <- bind_rows(medum25, medum50, medum75)
+medunmcombined <- bind_rows(medunm25, medunm50, medunm75)
+
+
+##I used this and just changed the variable from metro to non-metro
+rate_summary <- medumcombined %>%
+  pivot_longer(
+    cols = matches("estimate_\\d{4}|population_\\d{4}"),
+    names_to = c(".value", "Year"),
+    names_pattern = "(estimate|population)_(\\d{4})"
+  ) %>%
+  group_by(Quartile, Year) %>%
+  summarize(
+    total_estimate = sum(estimate, na.rm = TRUE),
+    total_population = sum(population, na.rm = TRUE),
+    agg_rate = total_estimate / total_population,
+    .groups = "drop"
+  )
+ggplot(rate_summary, aes(x = as.integer(Year), y = 1-agg_rate, color = Quartile)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(2013, 2023, by = 2))+
+  labs(
+    title = "Metro Male Higher Ed Enrollment Rate by 2013 County Educational Attainment Quartile",
+    subtitle = "Q1 (Bottom 25%), Q2-Q3 (Middle 50%), Q4 (Top 25%)",
+    x = "Year",
+    y = "Higher Ed Enrollment Rate",
+    color = "Quartile Group"
+  ) +
+  scale_color_manual(
+    values = c("Q1" = "skyblue", "Q2-Q3" = "gray60", "Q4" = "firebrick")
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r}
+###Function to pull multiple ACS5 vars
+pull_multiple_ACS_vars <- function(variable_codes, years, metro_trimmed = mt, nmetro_trimmed = nmt) {
+  library(tidyverse)
+  library(tidycensus)
+  data("fips_codes")
+  
+  # Limit to U.S. states + DC
+  states <- unique(fips_codes$state)[1:51]  # 50 states + DC
+  
+  for (yr in years) {
+    message(paste("Pulling data for year", yr))
+    
+    # Pull all variables for each state and bind them
+    acs_data <- map_dfr(states, function(st) {
+      message(paste("Fetching data for", st))
+      tryCatch({
+        get_acs(
+          geography = "tract",
+          state = st,
+          variables = variable_codes,
+          year = yr,
+          survey = "acs5",
+          cache_table = TRUE
+        ) %>%
+          select(GEOID, variable, estimate)
+      }, error = function(e) {
+        warning(paste("Skipping", st, "due to error:", e$message))
+        NULL
+      })
+    })
+    
+    # Pivot wider with each variable code getting its own estimate column
+    merged_data <- acs_data %>%
+      pivot_wider(names_from = variable, values_from = estimate) %>%
+      rename_with(.fn = ~ paste0(.x, "_", yr), .cols = all_of(variable_codes))
+    
+    # Join with metro/nonmetro
+    metro_trimmed <- left_join(metro_trimmed, merged_data, by = c("State-County-Tract FIPS Code" = "GEOID"))
+    nmetro_trimmed <- left_join(nmetro_trimmed, merged_data, by = c("State-County-Tract FIPS Code" = "GEOID"))
+  }
+  
+  return(list(metro = metro_trimmed, nonmetro = nmetro_trimmed))
+}
+```
+
+
+```{r}
+income<-pull_multiple_ACS_vars(variable_codes= c("B06010_002","B06010_004","B06010_005","B06010_006","B06010_007","B06010_008","B06010_009","B06010_010","B06010_011"),years = c(2013,2018,2023))
+mincome<-income[[1]]
+nmincome<-income[[2]]
+
+
+prep_income_distribution <- function(df, region_label) {
+  df %>%
+    select(matches("B06010.*_\\d{4}$")) %>%  # explicitly target income columns with year suffix
+    summarise(across(everything(), ~ sum(.x, na.rm = TRUE))) %>%
+    pivot_longer(cols = everything(), names_to = "bracket_year", values_to = "count") %>%
+    mutate(
+      year = as.integer(str_extract(bracket_year, "\\d{4}$")),
+      bracket_code = str_remove(bracket_year, "_\\d{4}$"),
+      Region = region_label
+    )
+}
+
+# Prepare data
+metro_long <- prep_income_distribution(mincome, "Metro")
+nonmetro_long <- prep_income_distribution(nmincome, "Nonmetro")
+
+# Combine and label brackets
+combined_income <- bind_rows(metro_long, nonmetro_long) %>%
+  mutate(
+    bracket = recode(bracket_code,
+                     "B06010_002" = "No Income",
+                     "B06010_004" = "Loss–$9,999",
+                     "B06010_005" = "$10,000–$14,999",
+                     "B06010_006" = "$15,000–$24,999",
+                     "B06010_007" = "$25,000–$34,999",
+                     "B06010_008" = "$35,000–$49,999",
+                     "B06010_009" = "$50,000–$64,999",
+                     "B06010_010" = "$65,000–$74,999",
+                     "B06010_011" = "$75,000+"
+    ),
+    bracket = factor(bracket, levels = c(
+      "No Income",
+      "Loss–$9,999",
+      "$10,000–$14,999",
+      "$15,000–$24,999",
+      "$25,000–$34,999",
+      "$35,000–$49,999",
+      "$50,000–$64,999",
+      "$65,000–$74,999",
+      "$75,000+"
+    ))
+  ) %>%
+  group_by(year, Region) %>%
+  mutate(density = count / sum(count)) %>%
+  ungroup()
+
+#Data taken directly from 2023 ACS table B06010
+overall_2023 <- tibble(
+  bracket = factor(c(
+    "No Income",
+    "Loss–$9,999",
+    "$10,000–$14,999",
+    "$15,000–$24,999",
+    "$25,000–$34,999",
+    "$35,000–$49,999",
+    "$50,000–$64,999",
+    "$65,000–$74,999",
+    "$75,000+"
+  ), levels = levels(combined_income$bracket)),
+  count = c(
+    34407490,
+    31797047,
+    18969507,
+    29241482,
+    26976058,
+    35047558,
+    27733601,
+    13053715,
+    58351432
+  ),
+  year = 2023,
+  Region = "Overall"
+) %>%
+  mutate(density = count / sum(count))
+
+combined_income<-bind_rows(combined_income,overall_2023)
+
+##SINGLE YEAR CHARTS###
+combined_income$bracket <- factor(
+  combined_income$bracket,
+  levels = rev(levels(combined_income$bracket))
+)
+
+
+ggplot(filter(combined_income, year == 2023),
+       aes(x = Region, y = density, fill = bracket)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +
+  labs(
+    title = "Income Composition in Small Counties – 2023",
+    x = "Region",
+    y = "Proportion of Individuals",
+    fill = "Income Bracket"
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Spectral", direction = -1) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 12),
+    legend.title = element_text(face = "bold")
+  )
+
+```
+
+
+```{r}
+cmtable<-npull_ACS_yrs_fast(variable_code ="C24010_008",years = c(2013,2018,2023),metro_trimmed = mt,nmetro_trimmed = nmt )
+mcm<-cmtable[[1]]
+nmcm<-cmtable[[2]]
+mcm<-mcm%>%drop_na(estimate_2023)
+nmcm<-nmcm%>%drop_na(estimate_2023)
+
+filter_by_percentiles <- function(df, column) {
+  q25 <- quantile(df[[column]], 0.25, na.rm = TRUE)
+  q75 <- quantile(df[[column]], 0.75, na.rm = TRUE)
+  
+  list(
+    below_25 = df %>% filter(.data[[column]] <= q25),
+    middle_50 = df %>% filter(.data[[column]] > q25 & .data[[column]] < q75),
+    above_75 = df %>% filter(.data[[column]] >= q75)
+  )
+}
+
+
+get_index <- function(df, label) {
+  df %>%
+    summarize(
+      `2013` = sum(estimate_2013, na.rm = TRUE),
+      `2018` = sum(estimate_2018, na.rm = TRUE),
+      `2023` = sum(estimate_2023, na.rm = TRUE)
+    ) %>%
+    pivot_longer(cols = everything(), names_to = "Year", values_to = "Total") %>%
+    mutate(
+      Year = as.integer(Year),
+      Index = Total / Total[Year == 2013],
+      Category = label
+    )
+}
+
+
+# Step 1: Summarize totals by year for metro
+index_metro <- mcm%>%
+  summarize(
+    `2013` = sum(estimate_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "Total") %>%
+  mutate(
+    Year = as.integer(Year),
+    Index = Total / Total[Year == 2013],
+    Category = "Metro"
+  )
+
+# Step 2: Repeat for nonmetro
+index_nonmetro <- nmcm %>%
+  summarize(
+    `2013` = sum(estimate_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "Total") %>%
+  mutate(
+    Year = as.integer(Year),
+    Index = Total / Total[Year == 2013],
+    Category = "Nonmetro"
+  )
+
+# Step 3: Combine and plot
+combined_index <- bind_rows(index_metro, index_nonmetro)
+
+ggplot(combined_index, aes(x = Year, y = Index, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Index of Male Computer and Math Jobs by Year",
+    x = "Year",
+    y = "Index (Base = 2013 = 1)",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01),limits = c(1,1.8)) +
+  theme_minimal()
+
+
+# Step 1: Summarize per capita for metro
+percap_metro<- mcm %>%
+  summarize(
+    `2013` = sum(estimate_2013, na.rm = TRUE) / sum(population_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018, na.rm = TRUE) / sum(population_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023, na.rm = TRUE) / sum(population_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "JobsPerCapita") %>%
+  mutate(Year = as.integer(Year), Category = "Metro Job Rate")
+
+
+percap_nonmetro <- nmcm %>%
+  summarize(
+    `2013` = sum(estimate_2013_total, na.rm = TRUE) / sum(population_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018_total, na.rm = TRUE) / sum(population_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023_total, na.rm = TRUE) / sum(population_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "JobsPerCapita") %>%
+  mutate(Year = as.integer(Year), Category = "Non-Metro Job Rate")
+
+percap_combined <- bind_rows(percap_nonmetro,percap_metro)
+
+ggplot(percap_combined, aes(x = Year, y = 1000*JobsPerCapita, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Computer and Math Jobs Per Thousand People",
+    x = "Year",
+    y = "Jobs Per Thousand People",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) +
+  theme_minimal()
+```
+
+
+```{r}
+###Female Computer and Math Jobs
+
+fcmtable<-npull_ACS_yrs_fast(variable_code ="C24010_044",years = c(2013,2018,2023) )
+
+# Extract female metro/nonmetro tables
+fmcm <- fcmtable[[1]] %>% drop_na(estimate_2023)
+fnmcm <- fcmtable[[2]] %>% drop_na(estimate_2023)
+
+# ==== INDEX PLOT ====
+
+# Metro
+index_f_metro <- fmcm %>%
+  summarize(
+    `2013` = sum(estimate_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "Total") %>%
+  mutate(
+    Year = as.integer(Year),
+    Index = Total / Total[Year == 2013],
+    Category = "Metro"
+  )
+
+# Nonmetro
+index_f_nonmetro <- fnmcm %>%
+  summarize(
+    `2013` = sum(estimate_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "Total") %>%
+  mutate(
+    Year = as.integer(Year),
+    Index = Total / Total[Year == 2013],
+    Category = "Nonmetro"
+  )
+
+# Combine and plot
+combined_f_index <- bind_rows(index_f_metro, index_f_nonmetro)
+
+ggplot(combined_f_index, aes(x = Year, y = Index, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Index of Female Computer and Math Jobs by Year",
+    x = "Year",
+    y = "Index (Base = 2013 = 1)",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  theme_minimal()
+
+
+# ==== PER CAPITA PLOT ====
+
+# Metro
+percap_f_metro <- fmcm %>%
+  summarize(
+    `2013` = sum(estimate_2013, na.rm = TRUE) / sum(population_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018, na.rm = TRUE) / sum(population_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023, na.rm = TRUE) / sum(population_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "JobsPerCapita") %>%
+  mutate(Year = as.integer(Year), Category = "Metro")
+
+# Nonmetro
+percap_f_nonmetro <- fnmcm %>%
+  summarize(
+    `2013` = sum(estimate_2013, na.rm = TRUE) / sum(population_2013, na.rm = TRUE),
+    `2018` = sum(estimate_2018, na.rm = TRUE) / sum(population_2018, na.rm = TRUE),
+    `2023` = sum(estimate_2023, na.rm = TRUE) / sum(population_2023, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "JobsPerCapita") %>%
+  mutate(Year = as.integer(Year), Category = "Nonmetro")
+
+# Combine and plot
+percap_f_combined <- bind_rows(percap_f_metro, percap_f_nonmetro)
+
+ggplot(percap_f_combined, aes(x = Year, y = 1000 * JobsPerCapita, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Female Computer and Math Jobs Per Thousand People",
+    x = "Year",
+    y = "Jobs Per Thousand People",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) +
+  theme_minimal()
+```
+
+
+```{r}
+###Combined Computer/Math
+# ---- Summed Columns for Metro ----
+
+mcmf_combined <- full_join(mcm, fmcm, by = "State-County-Tract FIPS Code") %>%
+  mutate(
+    estimate_2013_total = estimate_2013.x + estimate_2013.y,
+    estimate_2018_total = estimate_2018.x + estimate_2018.y,
+    estimate_2023_total = estimate_2023.x + estimate_2023.y,
+  )
+
+
+nmcmf_combined <- full_join(nmcm, fnmcm, by = "State-County-Tract FIPS Code") %>%
+  mutate(
+    estimate_2013_total = estimate_2013.x + estimate_2013.y,
+    estimate_2018_total = estimate_2018.x + estimate_2018.y,
+    estimate_2023_total = estimate_2023.x + estimate_2023.y,
+  )
+
+# Summarize totals and compute index
+index_metro <- mcmf_combined %>%
+  summarize(
+    `2013` = sum(estimate_2013_total, na.rm = TRUE),
+    `2018` = sum(estimate_2018_total, na.rm = TRUE),
+    `2023` = sum(estimate_2023_total, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Year", values_to = "Total") %>%
+  mutate(
+    Year = as.integer(Year),
+    Index = Total / Total[Year == 2013],
+    Category = "Metro"
+  )
+
+index_nonmetro <- nmcmf_combined %>%
+  summarize(
+    `2013` = sum(estimate_2013_total, na.rm = TRUE),
+    `2018` = sum(estimate_2018_total, na.rm = TRUE),
+    `2023` = sum(estimate_2023_total, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Year", values_to = "Total") %>%
+  mutate(
+    Year = as.integer(Year),
+    Index = Total / Total[Year == 2013],
+    Category = "Nonmetro"
+  )
+
+combined_index <- bind_rows(index_metro, index_nonmetro)
+
+ggplot(combined_index, aes(x = Year, y = Index, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Index of Total Computer and Math Jobs by Year",
+    x = "Year",
+    y = "Index (Base = 2013 = 1)",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  theme_minimal()
+
+percap_metro <- mcmf_combined %>%
+  summarize(
+    `2013` = sum(estimate_2013_total, na.rm = TRUE) / sum(population_2013.x, na.rm = TRUE),
+    `2018` = sum(estimate_2018_total, na.rm = TRUE) / sum(population_2018.x, na.rm = TRUE),
+    `2023` = sum(estimate_2023_total, na.rm = TRUE) / sum(population_2023.x, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Year", values_to = "JobsPerCapita") %>%
+  mutate(Year = as.integer(Year), Category = "Metro")
+
+percap_nonmetro <- nmcmf_combined %>%
+  summarize(
+    `2013` = sum(estimate_2013_total, na.rm = TRUE) / sum(population_2013.x, na.rm = TRUE),
+    `2018` = sum(estimate_2018_total, na.rm = TRUE) / sum(population_2018.x, na.rm = TRUE),
+    `2023` = sum(estimate_2023_total, na.rm = TRUE) / sum(population_2023.x, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Year", values_to = "JobsPerCapita") %>%
+  mutate(Year = as.integer(Year), Category = "Nonmetro")
+
+percap_combined <- bind_rows(percap_metro, percap_nonmetro)
+
+ggplot(percap_combined, aes(x = Year, y = 1000 * JobsPerCapita, color = Category)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Computer and Math Jobs Per Thousand People (Total)",
+    x = "Year",
+    y = "Jobs Per Thousand People",
+    color = "Category"
+  ) +
+  scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+  scale_y_continuous(labels = scales::number_format(accuracy = .1)) +
+  theme_minimal()
+
+```
+
+```{r}
+##Get Housing Stock Totals by Tract
+housingTest<-npull_ACS_yrs_fast(variable_code ="B25001_001",years=c(2013,2018,2023),metro_trimmed = mt,nmetro_trimmed = nmt)
+
+housingmt45<-housingTest[[1]]
+housingnm45<-housingTest[[2]]
+housingmt45<-housingmt45%>%
+  drop_na(estimate_2013)%>%
+  drop_na(estimate_2023)
+housingnm45<-housingnm45%>%
+  drop_na(estimate_2013)%>%
+  drop_na(estimate_2023)  
+
+##Filter into quartile groups
+hmpercentiles<-filter_by_percentiles(housingmt45,"population_2013")
+hm25<-hmpercentiles$below_25
+hm50<-hmpercentiles$middle_50
+hm75<-hmpercentiles$above_75
+
+hnmpercentiles <- filter_by_percentiles(housingnm45, "population_2013")
+hnm25 <- hnmpercentiles$below_25
+hnm50 <- hnmpercentiles$middle_50
+hnm75 <- hnmpercentiles$above_75
+
+  # Metro total population and population index
+  popdex_metro <- housingmt45%>%
+    summarize(
+      `2013` = sum(population_2013, na.rm = TRUE),
+      `2018` = sum(population_2018, na.rm = TRUE),
+      `2023` = sum(population_2023, na.rm = TRUE)
+    ) %>%
+    pivot_longer(cols = everything(), names_to = "Year", values_to = "TotalPop") %>%
+    mutate(
+      Year = as.integer(Year),
+      Popdex = TotalPop / TotalPop[Year == 2013],
+      Category = "Metro"
+    )
+  
+  # Nonmetro total population and population index
+  popdex_nonmetro <- housingnm45 %>%
+    summarize(
+      `2013` = sum(population_2013, na.rm = TRUE),
+      `2018` = sum(population_2018, na.rm = TRUE),
+      `2023` = sum(population_2023, na.rm = TRUE)
+    ) %>%
+    pivot_longer(cols = everything(), names_to = "Year", values_to = "TotalPop") %>%
+    mutate(
+      Year = as.integer(Year),
+      Popdex = TotalPop / TotalPop[Year == 2013],
+      Category = "Nonmetro"
+    )
+  
+  # Combine and plot
+  popdex_combined <- bind_rows(popdex_metro, popdex_nonmetro)
+  
+  ggplot(popdex_combined, aes(x = Year, y = Popdex, color = Category)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 2) +
+    labs(
+      title = "Aggregate Population Index by Year",
+      x = "Year",
+      y = "Population Index (Base = 2013 = 1)",
+      color = "Category"
+    ) +
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+    scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+    theme_minimal()
+```
+
+
+```{r}
+# Step 1: Sum total housing units by year for metro
+  housedex_metro <- housingmt45 %>%
+    summarize(
+      `2013` = sum(estimate_2013, na.rm = TRUE),
+      `2018` = sum(estimate_2018, na.rm = TRUE),
+      `2023` = sum(estimate_2023, na.rm = TRUE)
+    ) %>%
+    pivot_longer(cols = everything(), names_to = "Year", values_to = "TotalHousing") %>%
+    mutate(
+      Year = as.integer(Year),
+      Housedex = TotalHousing / TotalHousing[Year == 2013],
+      Category = "Metro"
+    )
+  
+  # Step 2: Repeat for nonmetro
+  housedex_nonmetro <- housingnm45 %>%
+    summarize(
+      `2013` = sum(estimate_2013, na.rm = TRUE),
+      `2018` = sum(estimate_2018, na.rm = TRUE),
+      `2023` = sum(estimate_2023, na.rm = TRUE)
+    ) %>%
+    pivot_longer(cols = everything(), names_to = "Year", values_to = "TotalHousing") %>%
+    mutate(
+      Year = as.integer(Year),
+      Housedex = TotalHousing / TotalHousing[Year == 2013],
+      Category = "Nonmetro"
+    )
+  
+  # Step 3: Combine and plot
+  housedex_total <- bind_rows(housedex_metro, housedex_nonmetro)
+  
+  ggplot(housedex_total, aes(x = Year, y = Housedex, color = Category)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 2) +
+    labs(
+      title = "Aggregate Housing Index by Year",
+      x = "Year",
+      y = "Housing Index (Base = 2013 = 1)",
+      color = "Category"
+    ) +
+    scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+    theme_minimal()
+```
+
+
+```{r}
+##Graphing by population quartile 
+##(This was unfortunately where I made a lot of graphs by changing the variables (e.g. using enrollment rate instead of population)).
+
+  get_popdex <- function(df, label) {
+    df %>%
+      summarize(
+        `2013` = sum(population_2013, na.rm = TRUE),
+        `2018` = sum(population_2018, na.rm = TRUE),
+        `2023` = sum(population_2023, na.rm = TRUE)
+      ) %>%
+      pivot_longer(cols = everything(), names_to = "Year", values_to = "TotalPop") %>%
+      mutate(
+        Year = as.integer(Year),
+        Popdex = TotalPop / TotalPop[Year == 2013],
+        Category = label
+      )
+  }
+  
+  # Calculate population index for each group
+  hm25_popdex <- get_popdex(hm25, "Bottom Quartile")
+  hm50_popdex <- get_popdex(hm50, "Middle 50%")
+  hm75_popdex <- get_popdex(hm75, "Top Quartile")
+  
+  hnm25_popdex <- get_popdex(hnm25, "Bottom Quartile")
+  hnm50_popdex <- get_popdex(hnm50, "Middle 50%")
+  hnm75_popdex <- get_popdex(hnm75, "Top Quartile")
+  
+  # Combine into two datasets
+  popdex_metro <- bind_rows(hm25_popdex, hm50_popdex, hm75_popdex)
+  popdex_nonmetro <- bind_rows(hnm25_popdex, hnm50_popdex, hnm75_popdex)
+  
+  # Plot: Metro
+  ggplot(popdex_metro, aes(x = Year, y = Popdex, color = Category)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 2) +
+    labs(
+      title = "Metro Change in Population by 2013 Population Quartile",
+      x = "Year",
+      y = "Population Index (Base = 2013 = 1)",
+      color = "Group"
+    ) +
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+    scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+    theme_minimal()
+  
+  # Plot: Nonmetro
+  ggplot(popdex_nonmetro, aes(x = Year, y = Popdex, color = Category)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 2) +
+    labs(
+      title = "Nonmetro Change in Population by 2013 Population Quartile",
+      x = "Year",
+      y = "Population Index (Base = 2013 = 1)",
+      color = "Group"
+    ) +
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+    scale_x_continuous(breaks = c(2013, 2018, 2023)) +
+    theme_minimal()
+  
+  
+```
+
