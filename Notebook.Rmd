@@ -350,19 +350,27 @@ ggplot(rate_summary, aes(x = as.integer(Year), y = 1-agg_rate, color = Quartile)
 
 
 ```{r}
-###Function to pull multiple ACS5 vars
-pull_multiple_ACS_vars <- function(variable_codes, years, metro_trimmed = mt, nmetro_trimmed = nmt) {
-  library(tidyverse)
-  library(tidycensus)
+pull_multiple_ACS_vars <- function(variable_codes, years, 
+                                   metro_trimmed = mt, 
+                                   nmetro_trimmed = nmt, 
+                                   crosswalk_path = "C:/Users/peter/Documents/ct20_ct10_xwalk.csv") {
+  
   data("fips_codes")
   
-  # Limit to U.S. states + DC
-  states <- unique(fips_codes$state)[1:51]  # 50 states + DC
-  
+  # Read tract crosswalk
+  crosswalk <- read_csv(crosswalk_path, show_col_types = FALSE) %>%
+    rename(
+      GEOID_2020 = TRTID2020,
+      GEOID_2010 = TRTID2010,
+      weight = TR20_TO_TR10_WEIGHT
+    ) %>%
+    mutate(across(starts_with("GEOID"), as.character))
+
+  states <- unique(fips_codes$state)[1:51]
+
   for (yr in years) {
     message(paste("Pulling data for year", yr))
-    
-    # Pull all variables for each state and bind them
+
     acs_data <- map_dfr(states, function(st) {
       message(paste("Fetching data for", st))
       tryCatch({
@@ -373,26 +381,39 @@ pull_multiple_ACS_vars <- function(variable_codes, years, metro_trimmed = mt, nm
           year = yr,
           survey = "acs5",
           cache_table = TRUE
-        ) %>%
-          select(GEOID, variable, estimate)
+        ) %>% select(GEOID, variable, estimate)
       }, error = function(e) {
         warning(paste("Skipping", st, "due to error:", e$message))
         NULL
       })
     })
-    
-    # Pivot wider with each variable code getting its own estimate column
-    merged_data <- acs_data %>%
-      pivot_wider(names_from = variable, values_from = estimate) %>%
-      rename_with(.fn = ~ paste0(.x, "_", yr), .cols = all_of(variable_codes))
-    
-    # Join with metro/nonmetro
-    metro_trimmed <- left_join(metro_trimmed, merged_data, by = c("State-County-Tract FIPS Code" = "GEOID"))
-    nmetro_trimmed <- left_join(nmetro_trimmed, merged_data, by = c("State-County-Tract FIPS Code" = "GEOID"))
+
+    # Normalize to 2010 tracts if year >= 2021
+    if (yr >= 2021) {
+      acs_wide <- acs_data %>%
+        rename(GEOID_2020 = GEOID) %>%
+        left_join(crosswalk, by = "GEOID_2020") %>%
+        mutate(weight = replace_na(weight, 0)) %>%
+        mutate(estimate_weighted = estimate * weight) %>%
+        group_by(GEOID_2010, variable) %>%
+        summarize(value = sum(estimate_weighted, na.rm = TRUE), .groups = "drop") %>%
+        pivot_wider(names_from = variable, values_from = value) %>%
+        rename_with(~ paste0(.x, "_", yr), .cols = all_of(variable_codes)) %>%
+        rename(`State-County-Tract FIPS Code` = GEOID_2010)
+    } else {
+      acs_wide <- acs_data %>%
+        pivot_wider(names_from = variable, values_from = estimate) %>%
+        rename_with(~ paste0(.x, "_", yr), .cols = all_of(variable_codes)) %>%
+        rename(`State-County-Tract FIPS Code` = GEOID)
+    }
+
+    metro_trimmed <- left_join(metro_trimmed, acs_wide, by = "State-County-Tract FIPS Code")
+    nmetro_trimmed <- left_join(nmetro_trimmed, acs_wide, by = "State-County-Tract FIPS Code")
   }
-  
+
   return(list(metro = metro_trimmed, nonmetro = nmetro_trimmed))
 }
+
 ```
 
 
