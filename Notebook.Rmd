@@ -7,10 +7,83 @@ output: html_notebook
 library(readxl)
 library(tidyverse)
 library(tidycensus)
-#import data
-counties<- read_excel("C:/Users/peter/Downloads/2022-geography-reference-manual.xlsx")
-RUCA <- read_excel("C:/Users/peter/Downloads/ruca2010revised (1).xlsx")
+library(aws.s3)
+library(s3)
+library(data.table)
 
+Sys.setenv(
+  "AWS_DEFAULT_REGION" = "us-east-2" # Replace with your S3 bucket's region (e.g., "us-east-1", "eu-west-1")
+)
+bucket_name <- "ruca4-analysis"
+
+object_names_to_pull <- c(
+  "Data/2022-geography-reference-manual.xlsx",
+  "Data/ct20_ct10_xwalk.csv",
+  "Data/ruca2010revised (1).xlsx"
+)
+
+# Initialize an empty list to store the loaded data frames
+loaded_data_list <- list()
+
+# --- Loop through each object and load it based on file type ---
+for (object_name in object_names_to_pull) {
+  file_extension <- tolower(tools::file_ext(object_name))
+  file_name_only <- basename(object_name) # Get just the filename for list naming
+  
+  message(paste("Attempting to pull: ", object_name))
+  
+  tryCatch({
+    if (file_extension == "csv") {
+      # Read CSV file using fread
+      current_data <- s3read_using(
+        FUN = fread,
+        object = object_name,
+        bucket = bucket_name
+      )
+      loaded_data_list[[file_name_only]] <- current_data
+      print(paste("Successfully loaded CSV '", object_name, "'. Head of data:", sep=""))
+      print(head(current_data))
+      
+    } else if (file_extension == "xlsx") {
+      # For .xlsx,  first download to a temp file, then read with readxl
+      temp_file <- tempfile(fileext = ".xlsx")
+      save_object(
+        object = object_name,
+        bucket = bucket_name,
+        file = temp_file
+      )
+      current_data <- read_excel(temp_file)
+      loaded_data_list[[file_name_only]] <- current_data
+      print(paste("Successfully loaded XLSX '", object_name, "'. Head of data:", sep=""))
+      print(head(current_data))
+      unlink(temp_file) # Clean up the temporary file
+      
+    } else {
+      warning(paste("Skipping unsupported file type: ", object_name))
+    }
+  }, error = function(e) {
+    message(paste("Error processing '", object_name, "': ", e$message, sep=""))
+    message("Please ensure:")
+    message("- Your AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_DEFAULT_REGION are correctly set as environment variables.")
+    message("- The 'bucket_name' ('ruca4-analysis') is correct.")
+    message("- The 'object_name' path (e.g., 'Data/2022-geography-reference-manual.xlsx') is exact and case-sensitive.")
+    message("- The IAM user has 's3:GetObject' permission for this bucket.")
+    message("- For XLSX files, 'readxl' package is installed and the file is not corrupted.")
+  })
+  print("---") # Separator for clarity
+}
+
+print("All specified files processed and loaded into 'loaded_data_list' list.")
+
+
+#import data
+
+counties<- loaded_data_list[[1]]
+RUCA<-loaded_data_list[[3]]
+```
+
+
+```{r}
 #Filter only metro counties
 metro_msa_codes <- counties %>%
   filter(`GEO-TYPE` =="08" & grepl("Metro Area", TITLE)) %>%
@@ -62,12 +135,12 @@ ggplot(df, aes(x = Category, y = Value, fill = Category)) +
 ##Function to pull census data from ACS
 npull_ACS_yrs_fast <- function(variable_code, population = "B01001_001", years,
                                          metro_trimmed = mt, nmetro_trimmed = nmt,
-                                         crosswalk_path = "C:/Users/peter/Documents/ct20_ct10_xwalk.csv"
+                                         crosswalk_var = loaded_data_list[[2]]
                                          ){
 
   data("fips_codes")
   
-  crosswalk <- read_csv(crosswalk_path, show_col_types = FALSE) %>%
+  crosswalk <-crosswalk_Var %>%
     rename(
       GEOID_2020 = TRTID2020,
       GEOID_2010 = TRTID2010,
@@ -353,12 +426,12 @@ ggplot(rate_summary, aes(x = as.integer(Year), y = 1-agg_rate, color = Quartile)
 pull_multiple_ACS_vars <- function(variable_codes, years, 
                                    metro_trimmed = mt, 
                                    nmetro_trimmed = nmt, 
-                                   crosswalk_path = "C:/Users/peter/Documents/ct20_ct10_xwalk.csv") {
+                                   crosswalk_path = loaded_data_list[[2]]) {
   
   data("fips_codes")
   
   # Read tract crosswalk
-  crosswalk <- read_csv(crosswalk_path, show_col_types = FALSE) %>%
+  crosswalk <- crosswalk_path %>%
     rename(
       GEOID_2020 = TRTID2020,
       GEOID_2010 = TRTID2010,
